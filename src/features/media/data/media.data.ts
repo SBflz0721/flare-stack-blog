@@ -1,11 +1,28 @@
 import type { SQL } from "drizzle-orm";
 import { and, count, desc, eq, inArray, lt, or, sql, sum } from "drizzle-orm";
-import { escapeLikeString } from "@/features/media/data/helper";
-import { MediaTable, PostMediaTable, PostsTable } from "@/lib/db/schema";
+import { containsText } from "@/lib/db/text-match";
+import {
+  MediaTable,
+  PostMediaTable,
+  PostRevisionMediaTable,
+  PostRevisionsTable,
+  PostsTable,
+  user,
+} from "@/lib/db/schema";
 
 export type Media = typeof MediaTable.$inferSelect;
+
+// An Admin's avatar picked from the media library is a reference, like a Post
+// image. Other users' avatar URLs are not, so they cannot pin media.
+const usedAsAdminAvatar = sql`exists (select 1 from ${user} where ${user.role} = 'admin' and instr(${user.image}, '/images/' || ${MediaTable.key}) > 0)`;
+
+// A Post Revision's images count too, so restoring it never brings back a
+// deleted image.
+const unreferenced = sql`not exists (select 1 from ${PostMediaTable} where ${PostMediaTable.mediaId} = ${MediaTable.id}) and not exists (select 1 from ${PostRevisionMediaTable} where ${PostRevisionMediaTable.mediaId} = ${MediaTable.id}) and not ${usedAsAdminAvatar}`;
+
 export type MediaListItem = Media & {
   postCount: number;
+  revisionOnlyPostCount: number;
   isCover: boolean;
 };
 
@@ -38,21 +55,36 @@ export async function findMediaByKey(
   return media ?? null;
 }
 
-export async function deleteMedia(db: DB, key: string) {
-  await db.delete(MediaTable).where(eq(MediaTable.key, key));
+/**
+ * Deletes the Media with `key` unless something uses it: a Post (draft,
+ * Public Content Snapshot or cover), a Post Revision or an Admin's avatar.
+ * The check and the delete are one statement, so a Post write that records
+ * the Media in the meantime (`mediaReferenceGuards`) makes it refuse. Returns
+ * whether it deleted.
+ */
+export async function deleteMediaIfUnused(db: DB, key: string) {
+  const deleted = await db
+    .delete(MediaTable)
+    .where(and(eq(MediaTable.key, key), unreferenced))
+    .returning({ id: MediaTable.id });
+  return deleted.length > 0;
 }
 
+/** Returns false when no Media has `key`. */
 export async function updateMediaName(db: DB, key: string, name: string) {
-  await db
+  const renamed = await db
     .update(MediaTable)
     .set({ fileName: name })
-    .where(eq(MediaTable.key, key));
+    .where(eq(MediaTable.key, key))
+    .returning({ id: MediaTable.id });
+  return renamed.length > 0;
 }
 
 export async function updateMediaFile(
   db: DB,
   key: string,
   data: {
+    url: string;
     fileName: string;
     mimeType: string;
     sizeInBytes: number;
@@ -63,6 +95,7 @@ export async function updateMediaFile(
   const [updated] = await db
     .update(MediaTable)
     .set({
+      url: data.url,
       fileName: data.fileName,
       mimeType: data.mimeType,
       sizeInBytes: data.sizeInBytes,
@@ -97,33 +130,19 @@ export async function getMediaList(
     conditions.push(lt(MediaTable.id, cursor));
   }
   if (search) {
-    const pattern = `%${escapeLikeString(search)}%`;
-    conditions.push(sql`${MediaTable.fileName} LIKE ${pattern} ESCAPE '\\'`);
+    conditions.push(containsText(MediaTable.fileName, search));
   }
-
-  let items: Array<Media>;
 
   if (unusedOnly) {
-    conditions.push(sql`${PostMediaTable.postId} IS NULL`);
-    items = await db
-      .select({
-        media: MediaTable,
-        postMediaId: PostMediaTable.postId,
-      })
-      .from(MediaTable)
-      .leftJoin(PostMediaTable, eq(MediaTable.id, PostMediaTable.mediaId))
-      .where(conditions.length > 0 ? and(...conditions) : undefined)
-      .orderBy(desc(MediaTable.id))
-      .limit(limit + 1)
-      .then((rows) => rows.map((row) => row.media));
-  } else {
-    items = await db
-      .select()
-      .from(MediaTable)
-      .where(conditions.length > 0 ? and(...conditions) : undefined)
-      .orderBy(desc(MediaTable.id))
-      .limit(limit + 1);
+    conditions.push(unreferenced);
   }
+
+  const items: Array<Media> = await db
+    .select()
+    .from(MediaTable)
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .orderBy(desc(MediaTable.id))
+    .limit(limit + 1);
 
   const hasMore = items.length > limit;
   if (hasMore) {
@@ -139,8 +158,7 @@ export async function getUnusedMediaKeys(db: DB): Promise<Array<string>> {
   const rows = await db
     .select({ key: MediaTable.key })
     .from(MediaTable)
-    .leftJoin(PostMediaTable, eq(MediaTable.id, PostMediaTable.mediaId))
-    .where(sql`${PostMediaTable.postId} IS NULL`);
+    .where(unreferenced);
   return rows.map((row) => row.key);
 }
 
@@ -155,8 +173,7 @@ export async function getMediaStats(db: DB) {
   const [unused] = await db
     .select({ unusedCount: count() })
     .from(MediaTable)
-    .leftJoin(PostMediaTable, eq(MediaTable.id, PostMediaTable.mediaId))
-    .where(sql`${PostMediaTable.postId} IS NULL`);
+    .where(unreferenced);
 
   return {
     totalCount: Number(totals.totalCount ?? 0),
@@ -181,15 +198,25 @@ async function withUsage(
   if (items.length === 0) return [];
 
   const ids = items.map((item) => item.id);
-  const [countRows, coverRows] = await Promise.all([
+  const [postRows, revisionRows, coverRows] = await Promise.all([
     db
       .select({
         mediaId: PostMediaTable.mediaId,
-        postCount: count(),
+        postId: PostMediaTable.postId,
       })
       .from(PostMediaTable)
-      .where(inArray(PostMediaTable.mediaId, ids))
-      .groupBy(PostMediaTable.mediaId),
+      .where(inArray(PostMediaTable.mediaId, ids)),
+    db
+      .selectDistinct({
+        mediaId: PostRevisionMediaTable.mediaId,
+        postId: PostRevisionsTable.postId,
+      })
+      .from(PostRevisionMediaTable)
+      .innerJoin(
+        PostRevisionsTable,
+        eq(PostRevisionsTable.id, PostRevisionMediaTable.revisionId),
+      )
+      .where(inArray(PostRevisionMediaTable.mediaId, ids)),
     db
       .select({
         coverMediaId: PostsTable.coverMediaId,
@@ -204,9 +231,17 @@ async function withUsage(
       ),
   ]);
 
-  const postCountById = new Map(
-    countRows.map((row) => [row.mediaId, Number(row.postCount)]),
-  );
+  const groupByMedia = (rows: Array<{ mediaId: number; postId: number }>) => {
+    const postIdsById = new Map<number, Set<number>>();
+    for (const row of rows) {
+      const postIds = postIdsById.get(row.mediaId) ?? new Set<number>();
+      postIds.add(row.postId);
+      postIdsById.set(row.mediaId, postIds);
+    }
+    return postIdsById;
+  };
+  const currentPostIds = groupByMedia(postRows);
+  const revisionPostIds = groupByMedia(revisionRows);
   const coverIds = new Set<number>();
   for (const row of coverRows) {
     if (row.coverMediaId != null) coverIds.add(row.coverMediaId);
@@ -217,7 +252,12 @@ async function withUsage(
 
   return items.map((item) => ({
     ...item,
-    postCount: postCountById.get(item.id) ?? 0,
+    postCount: currentPostIds.get(item.id)?.size ?? 0,
+    // A post that also uses the image in its draft or published version is
+    // already in postCount.
+    revisionOnlyPostCount: [...(revisionPostIds.get(item.id) ?? [])].filter(
+      (postId) => !currentPostIds.get(item.id)?.has(postId),
+    ).length,
     isCover: coverIds.has(item.id),
   }));
 }
@@ -225,9 +265,7 @@ async function withUsage(
 export async function deleteUnusedMedia(db: DB): Promise<Array<string>> {
   const rows = await db
     .delete(MediaTable)
-    .where(
-      sql`not exists (select 1 from ${PostMediaTable} where ${PostMediaTable.mediaId} = ${MediaTable.id})`,
-    )
+    .where(unreferenced)
     .returning({ key: MediaTable.key });
   return rows.map((row) => row.key);
 }

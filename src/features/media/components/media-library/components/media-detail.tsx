@@ -2,7 +2,11 @@ import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { Copy, ExternalLink, FileText, Upload, X } from "lucide-react";
 import { useEffect, useRef } from "react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { FuwariModal } from "@/components/ui/fuwari-modal";
+import { IconButton } from "@/components/ui/icon-button";
+import { SectionHeading } from "@/components/ui/page-heading";
 import {
   MOTION,
   useContentMotion,
@@ -15,7 +19,7 @@ import {
   MAX_FILE_SIZE,
 } from "@/features/media/media.schema";
 import { linkedPostsQuery } from "@/features/media/queries";
-import { getOriginalImageUrl } from "@/features/media/utils/media.utils";
+import { mediaUsageOf } from "@/features/media/utils/media.utils";
 import { formatBytes } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
 import type { MediaAsset } from "../types";
@@ -48,6 +52,7 @@ export function MediaDetail({
   }, [asset.key]);
   const fileRef = useRef<HTMLInputElement>(null);
   const busy = isReplacing;
+  const usage = mediaUsageOf(asset);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
   const {
@@ -71,21 +76,25 @@ export function MediaDetail({
 
   const content = (
     <>
-      <header className="media-inspector-header">
-        <h2>{m.media_preview_title()}</h2>
-        <button
-          type="button"
-          aria-label={m.common_close()}
-          disabled={preventClose || busy}
-          onClick={onClose}
-        >
-          <X size={19} />
-        </button>
-      </header>
+      <SectionHeading
+        className="media-inspector-header"
+        size="sm"
+        title={m.media_preview_title()}
+        actions={
+          <IconButton
+            label={m.common_close()}
+            size="md"
+            disabled={preventClose || busy}
+            onClick={onClose}
+          >
+            <X size={19} />
+          </IconButton>
+        }
+      />
       <div ref={contentRef}>
         <div className="media-inspector-preview">
           <img
-            src={getOriginalImageUrl(asset.key)}
+            src={asset.url}
             alt={asset.fileName}
             onLoad={(event) => {
               if (open && !reduced)
@@ -107,18 +116,25 @@ export function MediaDetail({
         </p>
         <section className="media-inspector-usage">
           <h3>
-            {asset.postCount
+            {usage === "current"
               ? m.media_used_in({ count: asset.postCount })
-              : m.media_unreferenced()}
+              : usage === "revisions-only"
+                ? m.media_badge_revisions()
+                : m.media_unreferenced()}
           </h3>
+          {usage === "current" && asset.revisionOnlyPostCount > 0 ? (
+            <p className="media-inspector-note">
+              {m.media_revisions_also({ count: asset.revisionOnlyPostCount })}
+            </p>
+          ) : null}
           {isPending ? (
             <p>{m.media_grid_loading()}</p>
           ) : isError ? (
             <p>
               {m.media_reference_fail()}{" "}
-              <button type="button" onClick={() => void refetch()}>
+              <Button variant="text" size="sm" onClick={() => void refetch()}>
                 {m.media_load_retry()}
-              </button>
+              </Button>
             </p>
           ) : (
             linkedPosts.map((post) => (
@@ -129,17 +145,27 @@ export function MediaDetail({
                 className="media-reference"
               >
                 <FileText size={16} />
-                <span>{post.title}</span>
-                {post.isCover ? <small>{m.media_badge_cover()}</small> : null}
+                <span className="media-reference-title">{post.title}</span>
                 <ExternalLink size={14} />
+                {post.isCover || (usage === "current" && post.revisionsOnly) ? (
+                  <span className="media-reference-badges">
+                    {post.isCover ? (
+                      <Badge tone="primary" size="sm">
+                        {m.media_badge_cover()}
+                      </Badge>
+                    ) : null}
+                    {usage === "current" && post.revisionsOnly ? (
+                      <Badge size="sm">{m.media_badge_revisions()}</Badge>
+                    ) : null}
+                  </span>
+                ) : null}
               </Link>
             ))
           )}
         </section>
         <div className="media-inspector-actions">
-          <button
-            type="button"
-            className="fuwari-btn-regular"
+          <Button
+            icon={<Copy size={16} />}
             onClick={async () => {
               try {
                 await navigator.clipboard.writeText(
@@ -151,28 +177,28 @@ export function MediaDetail({
               }
             }}
           >
-            <Copy size={16} />
             {m.media_copy_link()}
-          </button>
-          <button
-            type="button"
-            className="fuwari-btn-regular"
+          </Button>
+          <Button
+            icon={<Upload size={16} />}
+            loading={isReplacing}
             disabled={busy}
             onClick={() => fileRef.current?.click()}
           >
-            <Upload size={16} />
             {isReplacing ? m.common_processing() : m.media_replace()}
-          </button>
+          </Button>
         </div>
-        {asset.postCount === 0 ? (
-          <button
-            type="button"
+        {usage === "none" ? (
+          <Button
+            variant="text"
+            size="sm"
+            tone="danger"
             className="media-inspector-delete"
             disabled={busy}
             onClick={() => onDelete(asset)}
           >
             {m.media_delete()}
-          </button>
+          </Button>
         ) : null}
         <input
           ref={fileRef}
@@ -202,7 +228,7 @@ export function MediaDetail({
       open={open}
       onClose={onClose}
       busy={preventClose || busy}
-      className="media-inspector media-inspector-dialog"
+      className="media-inspector media-inspector-dialog admin-workspace"
       label={m.media_preview_title()}
     >
       {content}
